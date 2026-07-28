@@ -1,0 +1,40 @@
+# Copy to .dev.vars (gitignored) and fill in. Used by `wrangler dev` and,
+# via --env-file, by `make run`.
+#
+# In production these are Worker secrets: `wrangler secret put <NAME>`.
+
+# Gateway key for GET /sync. Generate with: openssl rand -hex 32
+# Validated in the Worker only — it is never forwarded to the container.
+SYNC_KEY=
+
+# ClickUp personal API token — the raw pk_… value, with no "Bearer" prefix.
+CLICKUP_TOKEN=
+
+# Productive.io credentials (X-Auth-Token / X-Organization-Id).
+PRODUCTIVE_TOKEN=
+PRODUCTIVE_ORG_ID=
+
+# --- optional: everything below has a compiled-in default in the Go binary ---
+# CLICKUP_LIST_ID=900501332334
+# PRODUCTIVE_PROJECT_ID=860646
+# PRODUCTIVE_TASK_LIST_ID=2385788
+# PRODUCTIVE_CF_CLICKUP_ID=242457
+# PRODUCTIVE_CF_CLICKUP_TAGS=242565
+# PRODUCTIVE_STATUS_OPEN_ID=161082
+# PRODUCTIVE_STATUS_DONE_ID=161083
+# PRODUCTIVE_DONE_STATUS_NAMES=Closed
+# CLICKUP_DONE_STATUSES=zawieszone,gotowe do wydania,wydane
+# CLICKUP_ESTIMATE_FIELD_IDS=33afbaec-1fae-49be-9e9f-35eb789ef911,611a0462-acb0-4c72-addc-927e62b116d6
+# CLICKUP_ESTIMATE_LABEL_MINUTES={"< 30m":20,"1h - 2h":90,"3h - 12h":600,"16h - 32h":1500,"> 40h":3900}
+# CLICKUP_INCLUDE_CLOSED=false
+# MERGE_CUSTOM_FIELDS=true
+# ALLOW_REPARENT=false
+# ESTIMATE_CLEAR_MODE=ignore
+# PRODUCTIVE_RPS=1.0
+# PRODUCTIVE_BURST_RPS=8.0
+# CLICKUP_RPS=1.5
+# MAX_CREATES=25
+# MAX_WRITES=300
+# MAX_RETRIES=4
+# SYNC_TIMEOUT=10m
+# LOG_LEVEL=info

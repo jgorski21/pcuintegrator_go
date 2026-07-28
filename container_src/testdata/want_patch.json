@@ -1,0 +1,19 @@
+{
+  "data": {
+    "type": "tasks",
+    "attributes": {
+      "title": "Updated title",
+      "custom_fields": {
+        "1000": 42,
+        "242457": "cu-9",
+        "242565": "",
+        "999": "keep"
+      }
+    },
+    "relationships": {
+      "project": { "data": { "type": "projects", "id": "860646" } },
+      "task_list": { "data": { "type": "task_lists", "id": "2385788" } },
+      "workflow_status": { "data": { "type": "workflow_statuses", "id": "161083" } }
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pcuintegrator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-28",
+
+  // Required for container stdout to reach `wrangler tail` and the dashboard.
+  "observability": { "enabled": true },
+
+  "containers": [
+    {
+      "class_name": "SyncContainer",
+      "name": "pcuintegrator-sync",
+      // Build context defaults to the Dockerfile's directory, which keeps
+      // node_modules out of the image build entirely.
+      "image": "./container_src/Dockerfile",
+      // 1/4 vCPU, 1 GiB. `lite` (256 MiB) risks an OOM: a few thousand ClickUp
+      // tasks with full custom_fields (including type_config.options) is tens of
+      // MB of JSON, and Unmarshal peaks well above the wire size. An OOM shows up
+      // as exit code 137 and a reset connection, with no error message.
+      "instance_type": "basic",
+      // Not a lock — the documented behaviour when exceeded is that the container
+      // START errors — but it does keep cost and blast radius bounded. The real
+      // mutual exclusion is the lease in the Durable Object.
+      "max_instances": 1,
+      // One instance, so a staged rollout buys nothing.
+      "rollout_step_percentage": [100],
+      // Give a running sync time to finish before a deploy SIGTERMs it.
+      "rollout_active_grace_period": 900
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC_CONTAINER", "class_name": "SyncContainer" }]
+  },
+
+  // Container-enabled Durable Objects must use new_sqlite_classes, not new_classes.
+  // The SQLite store is where the lease lock and the last run summary live, which is
+  // what makes them survive a container restart.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncContainer"] }],
+
+  // Replaces the .NET PeriodicTimer(4h). UTC. A scheduled invocation is hard-killed
+  // at 15 minutes of wall time, which is why SYNC_TIMEOUT stays at 10m.
+  "triggers": { "crons": ["0 */4 * * *"] },
+
+  // Non-secret tuning, forwarded to the container as environment variables (see
+  // CONTAINER_ENV_KEYS in src/index.ts). The Go binary has a compiled-in default
+  // for every one of these plus every ClickUp/Productive id; these are listed
+  // explicitly because they are the ones an operator actually reaches for.
+  // Values must be strings.
+  "vars": {
+    // Productive's documented limits are 100 req/10s AND 4000 req/30min, and they
+    // apply to the whole ORGANIZATION — shared with your colleagues' browsers and
+    // every other integration. .NET's flat 4s sleep was 0.25 rps; 1.0 is 4x faster
+    // with plenty of headroom. Raise deliberately, not by default.
+    "PRODUCTIVE_RPS": "1.0",
+    "PRODUCTIVE_BURST_RPS": "8.0",
+    "CLICKUP_RPS": "1.5",
+
+    // Circuit breakers: exceeding either aborts BEFORE any write and returns the
+    // plan. Override per request with ?max_creates=N / ?max_writes=N for a
+    // deliberate bulk import.
+    "MAX_CREATES": "25",
+    "MAX_WRITES": "300",
+
+    // Productive treats custom_fields as one hash, so a PATCH carrying only the two
+    // managed keys wipes every other custom field on the task. Set to "false" to
+    // reproduce the .NET behaviour exactly.
+    "MERGE_CUSTOM_FIELDS": "true",
+
+    // Must stay <= 12m: Cloudflare SIGKILLs 15 minutes after SIGTERM.
+    "SYNC_TIMEOUT": "10m",
+
+    "LOG_LEVEL": "info"
+  }
+
+  // Secrets (never here — use `wrangler secret put`):
+  //   SYNC_KEY            gateway key, checked in the Worker, never sent onward
+  //   SYNC_KEY_PREVIOUS   optional, accepted during a rotation
+  //   CLICKUP_TOKEN       raw pk_… token
+  //   PRODUCTIVE_TOKEN    X-Auth-Token
+  //   PRODUCTIVE_ORG_ID   X-Organization-Id
+}

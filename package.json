@@ -1,0 +1,20 @@
+{
+  "name": "pcuintegrator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ClickUp -> Productive.io one-way task sync. Cloudflare Worker fronting a Go container, triggered by GET /sync with a key in the header.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "tail": "wrangler tail --format pretty"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "wrangler": "^4.88.0"
+  }
+}

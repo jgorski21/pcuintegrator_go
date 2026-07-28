@@ -1,0 +1,19 @@
+{
+  "data": {
+    "type": "tasks",
+    "attributes": {
+      "title": "Parent task",
+      "initial_estimate": 90,
+      "custom_fields": {
+        "242457": "cu-1",
+        "242565": "backend, urgent"
+      }
+    },
+    "relationships": {
+      "project": { "data": { "type": "projects", "id": "860646" } },
+      "task_list": { "data": { "type": "task_lists", "id": "2385788" } },
+      "workflow_status": { "data": { "type": "workflow_statuses", "id": "161082" } },
+      "parent_task": { "data": { "type": "tasks", "id": "9100" } }
+    }
+  }
+}

@@ -133,7 +133,7 @@ func LoadConfig() (Config, error) {
 		MergeCustomFields: envBool("MERGE_CUSTOM_FIELDS", true),
 		AllowReparent:     envBool("ALLOW_REPARENT", false),
 		TitleMaxRunes:     envInt("PRODUCTIVE_TITLE_MAX", 140),
-		MaxSubtaskDepth:   envInt("PRODUCTIVE_MAX_SUBTASK_DEPTH", 5),
+		MaxSubtaskDepth:   envInt("PRODUCTIVE_MAX_SUBTASK_DEPTH", 1),
 
 		ProductiveRPS:      envFloat("PRODUCTIVE_RPS", 1.0),
 		ProductiveBurstRPS: envFloat("PRODUCTIVE_BURST_RPS", 8.0),

@@ -79,6 +79,8 @@ Wszystkie id i etykiety są **wkompilowane w binarkę** (dokładnie te, które .
 | `CLICKUP_ESTIMATE_FIELD_IDS` | dwa uuid „Szybka wycena" | API + FRONT |
 | `CLICKUP_ESTIMATE_LABEL_MINUTES` | JSON, 5 etykiet | luki `12h-16h`/`32h-40h` zostają |
 | `CLICKUP_INCLUDE_CLOSED` | `false` | **nie włączaj przypadkiem** — patrz niżej |
+| `PRODUCTIVE_TITLE_MAX` | `140` | limit Productive; dłuższe tytuły są obcinane |
+| `PRODUCTIVE_MAX_SUBTASK_DEPTH` | `1` | głębsze zagnieżdżenia lądują jako płaskie zadania |
 | `MERGE_CUSTOM_FIELDS` | `true` | `false` = destrukcyjne zachowanie .NET |
 | `ESTIMATE_CLEAR_MODE` | `ignore` | `null` = kasuje estymaty wpisane ręcznie |
 | `ALLOW_REPARENT` | `false` | |
@@ -189,6 +191,14 @@ Lista ClickUp / task list / projekt / custom fieldy / workflow statusy / statusy
 | Bezpieczniki, detekcja duplikatów, `reasons`, `ambiguous` | Widoczność i ograniczony promień rażenia. |
 | Tagi sortowane | .NET joinuje `HashSet` w losowej kolejności; sortowanie daje deterministyczne body (i golden testy) za cenę jednego PATCH-a per task z >1 tagiem. |
 | Nazwy env `P`/`POrgId`/`CU` → pełne | Jednoliterowe nazwy w środowisku kontenera to realna kolizja. |
+
+### Dwa limity Productive wykryte na pierwszym prawdziwym runie
+
+Obie te sytuacje .NET **ukrywał** — nie sprawdzał statusu zapisu, więc te zadania nigdy nie trafiły do Productive i nikt się o tym nie dowiedział.
+
+**Tytuł ponad 140 znaków** → `422 Invalid Attribute is too long (maximum is 140 characters) (data/attributes/title)`. Tytuł jest obcinany do `PRODUCTIVE_TITLE_MAX` znaków z wielokropkiem na końcu. Obcięcie następuje **przy mapowaniu ClickUp → Task, a nie przy budowaniu body** — i to jest istotne: Productive przechowuje wersję obciętą, więc porównywanie pełnego tytułu z ClickUp z tym, co leży w Productive, dawałoby różnicę w każdym runie i PATCH-a bez końca. Liczenie jest **po runach, nie bajtach** — limit jest w znakach, a polskie tytuły są pełne znaków wielobajtowych.
+
+**Zbyt głębokie subtaski** → `422 Invalid Attribute invalid level of subtasks (data/attributes/parent_task)`. Productive przyjmuje `PRODUCTIVE_MAX_SUBTASK_DEPTH` poziomów zagnieżdżenia (domyślnie 1 — wartość wywnioskowana z tego właśnie błędu, nie z dokumentacji). Zadanie głębsze jest tworzone jako **płaskie** z ostrzeżeniem `subtask_too_deep`, a jego własne dzieci zaczynają liczenie od nowa, więc zachowujemy tyle struktury, ile Productive dopuszcza. Gdyby limit był ustawiony za wysoko, `Execute` ponawia create bez rodzica — to jedyne miejsce, gdzie ponowienie zapisu jest bezpieczne, bo `422` dowodzi, że nic nie powstało.
 
 ### Trzy naprawy wiecznego churnu
 Kandydaci na wyjaśnienie, dlaczego `sleep(4s)` per zapis był w ogóle znośny. **Żadna nie zmienia danych — tylko przestają lecieć bezcelowe PATCH-e.**

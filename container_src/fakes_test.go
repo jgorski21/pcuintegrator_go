@@ -52,6 +52,8 @@ func testConfig(clickUpBase, productiveBase string) Config {
 
 		MergeCustomFields: true,
 		EstimateMode:      EstimateIgnoreNil,
+		TitleMaxRunes:     140,
+		MaxSubtaskDepth:   1,
 
 		ProductiveRPS:      10_000,
 		ProductiveBurstRPS: 10_000,
@@ -397,6 +399,12 @@ func (f *fakeProductive) handleCreate(w http.ResponseWriter, body []byte) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if f.rejectTitle(w, in.Data.Attributes.Title) {
+		return
+	}
+	if f.rejectSubtaskLevel(w, &in) {
+		return
+	}
 
 	f.mu.Lock()
 	f.nextID++
@@ -454,6 +462,9 @@ func (f *fakeProductive) handleUpdate(w http.ResponseWriter, r *http.Request, bo
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if f.rejectTitle(w, in.Data.Attributes.Title) {
+		return
+	}
 
 	f.mu.Lock()
 	t.Title = in.Data.Attributes.Title
@@ -482,6 +493,42 @@ func (f *fakeProductive) handleUpdate(w http.ResponseWriter, r *http.Request, bo
 
 	w.Header().Set("Content-Type", "application/vnd.api+json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "type": "tasks"}})
+}
+
+// rejectTitle reproduces Productive's real 422, observed in production:
+// "Invalid Attribute is too long (maximum is 140 characters) (data/attributes/title)".
+// Counted in runes, which is what makes the byte-vs-rune distinction testable.
+func (f *fakeProductive) rejectTitle(w http.ResponseWriter, title string) bool {
+	if len([]rune(title)) <= 140 {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/vnd.api+json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_, _ = w.Write([]byte(`{"errors":[{"status":"422","title":"Invalid Attribute",` +
+		`"detail":"is too long (maximum is 140 characters)","source":{"pointer":"data/attributes/title"}}]}`))
+	return true
+}
+
+// rejectSubtaskLevel reproduces the other production 422:
+// "Invalid Attribute invalid level of subtasks (data/attributes/parent_task)".
+// Productive accepts one level of nesting, so a parent that itself has a parent is
+// rejected.
+func (f *fakeProductive) rejectSubtaskLevel(w http.ResponseWriter, in *incomingWrite) bool {
+	if in.Data.Relationships.ParentTask == nil || in.Data.Relationships.ParentTask.Data == nil {
+		return false
+	}
+	f.mu.Lock()
+	parent, ok := f.tasks[in.Data.Relationships.ParentTask.Data.ID]
+	grandparent := ok && parent.ParentTaskID != ""
+	f.mu.Unlock()
+	if !grandparent {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/vnd.api+json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_, _ = w.Write([]byte(`{"errors":[{"status":"422","title":"Invalid Attribute",` +
+		`"detail":"invalid level of subtasks","source":{"pointer":"data/attributes/parent_task"}}]}`))
+	return true
 }
 
 func (f *fakeProductive) task(id string) *fakeProductiveTask {

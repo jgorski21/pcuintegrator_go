@@ -61,6 +61,23 @@ type Config struct {
 	EstimateMode      EstimateMode
 	AllowReparent     bool
 
+	// TitleMaxRunes is Productive's own limit on `title`. Exceeding it returns
+	// 422 "Attribute is too long (maximum is 140 characters)". .NET never checked
+	// the write status, so every ClickUp task with a longer title has silently
+	// failed to sync since day one.
+	//
+	// The truncation happens when mapping ClickUp -> Task, NOT when building the
+	// body: Productive stores the truncated title, so comparing an untruncated
+	// ClickUp title against it would differ forever and PATCH on every run.
+	TitleMaxRunes int
+
+	// MaxSubtaskDepth is how deep Productive accepts nested subtasks. Exceeding it
+	// returns 422 "invalid level of subtasks (data/attributes/parent_task)".
+	// Anything deeper is flattened to a top-level task with a warning; children of
+	// a flattened task start a fresh level, so as much structure as Productive
+	// allows is preserved.
+	MaxSubtaskDepth int
+
 	// --- limits ---
 	ProductiveRPS      float64 // sustained; documented ceiling is 4000/30min = 2.22
 	ProductiveBurstRPS float64 // burst; documented ceiling is 100/10s = 10
@@ -115,6 +132,8 @@ func LoadConfig() (Config, error) {
 		IncludeClosed:     envBool("CLICKUP_INCLUDE_CLOSED", false),
 		MergeCustomFields: envBool("MERGE_CUSTOM_FIELDS", true),
 		AllowReparent:     envBool("ALLOW_REPARENT", false),
+		TitleMaxRunes:     envInt("PRODUCTIVE_TITLE_MAX", 140),
+		MaxSubtaskDepth:   envInt("PRODUCTIVE_MAX_SUBTASK_DEPTH", 5),
 
 		ProductiveRPS:      envFloat("PRODUCTIVE_RPS", 1.0),
 		ProductiveBurstRPS: envFloat("PRODUCTIVE_BURST_RPS", 8.0),
@@ -209,6 +228,12 @@ func (c Config) validate() error {
 	}
 	if c.MaxPages <= 0 {
 		return fmt.Errorf("MAX_PAGES must be > 0")
+	}
+	if c.TitleMaxRunes <= 0 {
+		return fmt.Errorf("PRODUCTIVE_TITLE_MAX must be > 0")
+	}
+	if c.MaxSubtaskDepth < 0 {
+		return fmt.Errorf("PRODUCTIVE_MAX_SUBTASK_DEPTH must be >= 0 (0 disables subtasks entirely)")
 	}
 	if len(c.EstimateLabelMinutes) == 0 {
 		return fmt.Errorf("CLICKUP_ESTIMATE_LABEL_MINUTES resolved to an empty map")

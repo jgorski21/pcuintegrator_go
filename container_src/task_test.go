@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNormalizeTags(t *testing.T) {
@@ -53,6 +55,68 @@ func TestTagsRoundTripIsStable(t *testing.T) {
 	}
 	if !tagsEqual(tags, parseTagsField(field)) {
 		t.Fatalf("round trip not stable: %#v vs %#v", tags, parseTagsField(field))
+	}
+}
+
+// Productive caps `title` at 140 characters and returns 422 past it. Observed in
+// production; .NET never checked the write status, so those tasks silently never
+// synced at all.
+func TestTruncateTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       string
+		max      int
+		wantLen  int
+		wantSame bool
+	}{
+		{"short", "krótki tytuł", 140, 12, true},
+		{"exactly at the limit", strings.Repeat("a", 140), 140, 140, true},
+		{"one over", strings.Repeat("a", 141), 140, 140, false},
+		{"far over", strings.Repeat("a", 500), 140, 140, false},
+		{"limit disabled", strings.Repeat("a", 500), 0, 500, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateTitle(tc.in, tc.max)
+			if n := len([]rune(got)); n != tc.wantLen {
+				t.Fatalf("rune length = %d, want %d", n, tc.wantLen)
+			}
+			if (got == tc.in) != tc.wantSame {
+				t.Fatalf("unchanged = %v, want %v", got == tc.in, tc.wantSame)
+			}
+			if !tc.wantSame && !strings.HasSuffix(got, "…") {
+				t.Fatalf("a truncated title should be marked: %q", got)
+			}
+		})
+	}
+}
+
+// Counting must be by RUNE, not byte: the limit is stated in characters and Polish
+// titles are full of multibyte characters. A byte-based cut would truncate far too
+// early and could split a character in half.
+func TestTruncateTitleIsRuneAwareNotByteAware(t *testing.T) {
+	// 200 Polish characters = 400 bytes.
+	in := strings.Repeat("ą", 200)
+	got := truncateTitle(in, 140)
+
+	if n := len([]rune(got)); n != 140 {
+		t.Fatalf("rune length = %d, want 140", n)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("truncation split a multibyte character")
+	}
+	// A byte-based implementation would have produced 70 characters.
+	if len([]rune(got)) == 70 {
+		t.Fatal("truncated on bytes instead of runes")
+	}
+}
+
+// Truncating must be idempotent, or the comparison never converges: Productive
+// stores the cut title, and re-truncating it has to yield the same string.
+func TestTruncateTitleIsIdempotent(t *testing.T) {
+	once := truncateTitle(strings.Repeat("słowo ", 60), 140)
+	if twice := truncateTitle(once, 140); twice != once {
+		t.Fatalf("not idempotent:\n%q\n%q", once, twice)
 	}
 }
 

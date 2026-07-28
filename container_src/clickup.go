@@ -142,8 +142,10 @@ func toTask(raw clickUpTask, cfg Config) (Task, []string) {
 	}
 
 	return Task{
-		ClickUpID:       raw.ID,
-		Title:           strings.TrimSpace(raw.Name),
+		ClickUpID: raw.ID,
+		// Truncated here, not in buildBody: Productive stores the truncated title,
+		// so comparing the full ClickUp title against it would differ on every run.
+		Title:           truncateTitle(strings.TrimSpace(raw.Name), cfg.TitleMaxRunes),
 		Status:          status,
 		Tags:            normalizeTags(tags),
 		InitialEstimate: estimate,

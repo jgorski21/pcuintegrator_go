@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -87,6 +89,11 @@ func Plan(clickUp []Task, snap productiveSnapshot, cfg Config) plan {
 		inRun[t.ClickUpID] = i
 	}
 
+	// Nesting level each task will actually occupy in Productive, filled in as we
+	// go. Safe because `ordered` is parent-first, so a parent's level is always
+	// known before its children are considered.
+	effDepth := make(map[string]int, len(ordered))
+
 	for i, t := range ordered {
 		if ids, bad := snap.Conflicted[t.ClickUpID]; bad {
 			p.Actions = append(p.Actions, action{Task: t, Kind: actionConflict})
@@ -99,7 +106,7 @@ func Plan(clickUp []Task, snap productiveSnapshot, cfg Config) plan {
 		}
 
 		a := action{Task: t}
-		resolveParent(&a, t, i, inRun, snap, &p)
+		resolveParent(&a, t, i, inRun, effDepth, snap, cfg, &p)
 
 		existing, found := snap.ByClickUpID[t.ClickUpID]
 		if !found {
@@ -147,29 +154,51 @@ func Plan(clickUp []Task, snap productiveSnapshot, cfg Config) plan {
 	return p
 }
 
-// resolveParent picks exactly one of the three parent fields (or none).
-func resolveParent(a *action, t Task, idx int, inRun map[string]int, snap productiveSnapshot, p *plan) {
+// resolveParent picks exactly one of the three parent fields (or none) and records
+// the nesting level the task will occupy in Productive.
+func resolveParent(a *action, t Task, idx int, inRun, effDepth map[string]int, snap productiveSnapshot, cfg Config, p *plan) {
+	flatten := func(reason string) {
+		a.ParentProductiveID, a.ParentClickUpID = "", ""
+		a.FlatParent = t.ClickUpParentID
+		effDepth[t.ClickUpID] = 0
+		p.Warnings = append(p.Warnings, fmt.Sprintf("clickup %s: %s; creating flat", t.ClickUpID, reason))
+	}
+
 	parent := t.ClickUpParentID
 	if parent == "" {
+		effDepth[t.ClickUpID] = 0
 		return
 	}
 	if _, bad := snap.Conflicted[parent]; bad {
-		a.FlatParent = parent
-		p.Warnings = append(p.Warnings, fmt.Sprintf(
-			"clickup %s: parent %s is in conflict; creating flat", t.ClickUpID, parent))
+		flatten("parent " + parent + " is in conflict")
 		return
 	}
+
 	if pe, ok := snap.ByClickUpID[parent]; ok {
 		a.ParentProductiveID = pe.ProductiveID
-		return
-	}
-	if pidx, ok := inRun[parent]; ok && pidx < idx {
+	} else if pidx, ok := inRun[parent]; ok && pidx < idx {
 		a.ParentClickUpID = parent
+	} else {
+		flatten("parent " + parent + " is outside the synced set")
 		return
 	}
-	a.FlatParent = parent
-	p.Warnings = append(p.Warnings, fmt.Sprintf(
-		"clickup %s: parent %s is outside the synced set; creating flat", t.ClickUpID, parent))
+
+	// Productive rejects nesting past MaxSubtaskDepth with
+	// 422 "invalid level of subtasks (data/attributes/parent_task)". Flattening the
+	// too-deep task instead of letting the write fail keeps the task in Productive,
+	// and because its own children then start a fresh level, as much of the tree as
+	// Productive allows survives.
+	//
+	// A parent outside this run has an unknown level, so effDepth[parent] reads 0 —
+	// the optimistic case. If Productive disagrees, Execute retries the create
+	// without a parent.
+	depth := effDepth[parent] + 1
+	if depth > cfg.MaxSubtaskDepth {
+		flatten(fmt.Sprintf("subtask_too_deep: would be level %d, Productive allows %d",
+			depth, cfg.MaxSubtaskDepth))
+		return
+	}
+	effDepth[t.ClickUpID] = depth
 }
 
 // dedupeByID keeps the first occurrence, matching GroupBy(id).Select(g => g.First()).
@@ -449,6 +478,21 @@ func Execute(ctx context.Context, pr *apiClient, p plan, snap productiveSnapshot
 				continue
 			}
 			newID, err := createTask(ctx, pr, body)
+
+			// Safety net for MaxSubtaskDepth being set higher than Productive really
+			// allows. Retrying here is safe precisely because a 422 is a DEFINITIVE
+			// rejection — unlike a 5xx or a timeout, it proves nothing was created,
+			// so this cannot produce a duplicate.
+			if err != nil && parent != "" && isSubtaskLevelRejection(err) {
+				res.Warnings = append(res.Warnings, fmt.Sprintf(
+					"clickup %s: Productive rejected the subtask level; retrying as a flat task "+
+						"(lower PRODUCTIVE_MAX_SUBTASK_DEPTH to plan this correctly)", a.Task.ClickUpID))
+				if flatBody, buildErr := buildBody(a.Task, "", nil, cfg); buildErr == nil {
+					parent = ""
+					newID, err = createTask(ctx, pr, flatBody)
+				}
+			}
+
 			if err != nil {
 				res.Failed++
 				res.Errors = append(res.Errors, fmt.Sprintf("clickup %s: create: %v", a.Task.ClickUpID, err))
@@ -503,6 +547,17 @@ func Execute(ctx context.Context, pr *apiClient, p plan, snap productiveSnapshot
 				"productive_id", existing.ProductiveID, "reasons", a.Reasons)
 		}
 	}
+}
+
+// isSubtaskLevelRejection recognises Productive's
+// 422 "Invalid Attribute invalid level of subtasks (data/attributes/parent_task)".
+func isSubtaskLevelRejection(err error) bool {
+	var he *httpError
+	if !errors.As(err, &he) || he.Status != http.StatusUnprocessableEntity {
+		return false
+	}
+	body := strings.ToLower(string(he.Body))
+	return strings.Contains(body, "level of subtasks") || strings.Contains(body, "parent_task")
 }
 
 // isAmbiguousWriteFailure reports whether a create may have landed server-side.

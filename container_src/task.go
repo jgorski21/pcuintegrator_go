@@ -128,6 +128,30 @@ func parseTagsField(v string) []string {
 // formatTagsField is deterministic because normalizeTags sorted the input.
 func formatTagsField(tags []string) string { return strings.Join(tags, ", ") }
 
+// truncateTitle cuts the title down to what Productive accepts.
+//
+// Counting is by RUNE, not byte: Productive's limit is stated in characters, and
+// Polish titles are full of multibyte characters — a byte-based cut would both
+// truncate too early and risk splitting a character in half.
+//
+// Applied at mapping time so both sides of the comparison see the same string.
+// If it were applied only when building the body, Productive would hold the
+// truncated title, the ClickUp side would hold the full one, and the diff would
+// never resolve — a PATCH on every run, forever.
+func truncateTitle(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	// Leave room for the ellipsis so the result is exactly maxRunes and it is
+	// obvious to a human that the title was cut.
+	cut := strings.TrimRight(string(runes[:maxRunes-1]), " \t\n")
+	return cut + "…"
+}
+
 // normEstimate collapses nil and 0 to the same thing.
 //
 // CHURN FIX #3: ClickUp's resolver returns ms/60000 with integer truncation, so a

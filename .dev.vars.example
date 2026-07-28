@@ -29,6 +29,10 @@ PRODUCTIVE_ORG_ID=
 # CLICKUP_INCLUDE_CLOSED=false
 # MERGE_CUSTOM_FIELDS=true
 # ALLOW_REPARENT=false
+# Productive limits: title length (422 past it) and subtask nesting depth
+# (422 "invalid level of subtasks"). Both observed on the first real run.
+# PRODUCTIVE_TITLE_MAX=140
+# PRODUCTIVE_MAX_SUBTASK_DEPTH=1
 # ESTIMATE_CLEAR_MODE=ignore
 # PRODUCTIVE_RPS=1.0
 # PRODUCTIVE_BURST_RPS=8.0

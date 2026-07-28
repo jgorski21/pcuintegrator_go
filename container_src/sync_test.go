@@ -73,6 +73,9 @@ func TestPlanDedupeKeepsFirst(t *testing.T) {
 
 func TestPlanOrdersParentsBeforeChildren(t *testing.T) {
 	cfg := testConfig("http://x/", "http://y/")
+	// This test is about ORDERING only; the depth cap is covered separately by
+	// TestPlanFlattensTooDeepSubtasks. Raise it so the two concerns stay independent.
+	cfg.MaxSubtaskDepth = 10
 
 	// Deliberately inverted input: grandchild, child, root.
 	clickUp := []Task{
@@ -206,6 +209,64 @@ func TestPlanReportsReparentNeeded(t *testing.T) {
 	}
 }
 
+// Productive rejects nesting past one level with
+// 422 "invalid level of subtasks". Flattening the too-deep task keeps it in
+// Productive, and its own children then start a fresh level, so as much of the
+// tree as Productive allows survives.
+func TestPlanFlattensTooDeepSubtasks(t *testing.T) {
+	cfg := testConfig("http://x/", "http://y/")
+	cfg.MaxSubtaskDepth = 1
+
+	p := planFor(t, []Task{
+		{ClickUpID: "cu-1", Title: "root"},
+		{ClickUpID: "cu-2", Title: "child", ClickUpParentID: "cu-1"},
+		{ClickUpID: "cu-3", Title: "grandchild", ClickUpParentID: "cu-2"},
+		{ClickUpID: "cu-4", Title: "great-grandchild", ClickUpParentID: "cu-3"},
+	}, productiveSnapshot{}, cfg)
+
+	byID := map[string]action{}
+	for _, a := range p.Actions {
+		byID[a.Task.ClickUpID] = a
+	}
+
+	if got := byID["cu-2"]; got.ParentClickUpID != "cu-1" || got.FlatParent != "" {
+		t.Fatalf("level 1 must keep its parent: %+v", got)
+	}
+	if got := byID["cu-3"]; got.FlatParent != "cu-2" || got.ParentClickUpID != "" || got.ParentProductiveID != "" {
+		t.Fatalf("level 2 must be flattened: %+v", got)
+	}
+	// The flattened task became a root, so its own child fits at level 1 again.
+	if got := byID["cu-4"]; got.ParentClickUpID != "cu-3" || got.FlatParent != "" {
+		t.Fatalf("child of a flattened task should re-chain: %+v", got)
+	}
+
+	found := false
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "subtask_too_deep") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a subtask_too_deep warning, got %v", p.Warnings)
+	}
+}
+
+func TestPlanMaxSubtaskDepthZeroDisablesNesting(t *testing.T) {
+	cfg := testConfig("http://x/", "http://y/")
+	cfg.MaxSubtaskDepth = 0
+
+	p := planFor(t, []Task{
+		{ClickUpID: "cu-1", Title: "root"},
+		{ClickUpID: "cu-2", Title: "child", ClickUpParentID: "cu-1"},
+	}, productiveSnapshot{}, cfg)
+
+	for _, a := range p.Actions {
+		if a.ParentClickUpID != "" || a.ParentProductiveID != "" {
+			t.Fatalf("no task may keep a parent: %+v", a)
+		}
+	}
+}
+
 func TestPlanIsDeterministic(t *testing.T) {
 	cfg := testConfig("http://x/", "http://y/")
 	snap := productiveSnapshot{ByClickUpID: map[string]existingTask{}, Conflicted: map[string][]string{}}
@@ -305,6 +366,120 @@ func TestRunConvergesToZeroWrites(t *testing.T) {
 	third := runSync(t, cfg, RunOptions{})
 	if third.Created != 0 || third.Updated != 0 {
 		t.Fatalf("third run drifted: created=%d updated=%d reasons=%v", third.Created, third.Updated, third.Reasons)
+	}
+}
+
+// End to end against a fake that enforces Productive's real 140-character limit.
+// The second assertion is the important one: truncating at mapping time is what
+// makes the comparison converge. Truncating only when building the body would leave
+// Productive holding the short title and ClickUp the long one — a PATCH every run,
+// forever.
+func TestRunLongTitleIsTruncatedAndConverges(t *testing.T) {
+	longTitle := "Przygotować " + strings.Repeat("bardzo długi opis zadania ", 20)
+	if len([]rune(longTitle)) <= 140 {
+		t.Fatalf("test setup: title is only %d runes", len([]rune(longTitle)))
+	}
+
+	cu := newFakeClickUp(t, []map[string]any{clickUpTaskJSON("cu-1", longTitle, "open")})
+	pr := newFakeProductive(t)
+	cfg := testConfig(cu.baseURL(), pr.baseURL())
+
+	first := runSync(t, cfg, RunOptions{})
+	if first.Created != 1 || first.Failed != 0 {
+		t.Fatalf("created=%d failed=%d errors=%v", first.Created, first.Failed, first.Errors)
+	}
+	stored := pr.findByClickUpID("cu-1")
+	if len(stored) != 1 {
+		t.Fatalf("stored %d tasks", len(stored))
+	}
+	if n := len([]rune(stored[0].Title)); n != 140 {
+		t.Fatalf("stored title is %d runes, want exactly 140", n)
+	}
+
+	second := runSync(t, cfg, RunOptions{})
+	if second.Created != 0 || second.Updated != 0 {
+		t.Fatalf("NOT CONVERGED on a truncated title: created=%d updated=%d reasons=%v",
+			second.Created, second.Updated, second.Reasons)
+	}
+}
+
+// Three ClickUp levels against a Productive that only accepts one. The plan
+// flattens level 2 up front, so no write is even attempted that Productive would
+// reject — and nothing is lost.
+func TestRunDeepSubtasksAreFlattenedNotFailed(t *testing.T) {
+	cu := newFakeClickUp(t, []map[string]any{
+		clickUpTaskJSON("cu-1", "root", "open"),
+		func() map[string]any {
+			m := clickUpTaskJSON("cu-2", "child", "open")
+			m["parent"] = "cu-1"
+			return m
+		}(),
+		func() map[string]any {
+			m := clickUpTaskJSON("cu-3", "grandchild", "open")
+			m["parent"] = "cu-2"
+			return m
+		}(),
+	})
+	pr := newFakeProductive(t)
+	cfg := testConfig(cu.baseURL(), pr.baseURL())
+
+	res := runSync(t, cfg, RunOptions{})
+	if res.Created != 3 || res.Failed != 0 {
+		t.Fatalf("created=%d failed=%d errors=%v", res.Created, res.Failed, res.Errors)
+	}
+
+	root := pr.findByClickUpID("cu-1")[0]
+	child := pr.findByClickUpID("cu-2")[0]
+	grandchild := pr.findByClickUpID("cu-3")[0]
+
+	if child.ParentTaskID != root.ID {
+		t.Fatalf("child parent = %q, want %q", child.ParentTaskID, root.ID)
+	}
+	if grandchild.ParentTaskID != "" {
+		t.Fatalf("grandchild should be flat, parent = %q", grandchild.ParentTaskID)
+	}
+
+	if second := runSync(t, cfg, RunOptions{}); second.Created != 0 || second.Updated != 0 {
+		t.Fatalf("not converged: created=%d updated=%d", second.Created, second.Updated)
+	}
+}
+
+// Safety net for MaxSubtaskDepth configured higher than Productive really allows.
+// Retrying is safe here and only here: a 422 is a definitive rejection, so nothing
+// was created and no duplicate is possible.
+func TestExecuteRetriesCreateFlatOnSubtaskLevelRejection(t *testing.T) {
+	cu := newFakeClickUp(t, []map[string]any{
+		clickUpTaskJSON("cu-1", "root", "open"),
+		func() map[string]any {
+			m := clickUpTaskJSON("cu-2", "child", "open")
+			m["parent"] = "cu-1"
+			return m
+		}(),
+		func() map[string]any {
+			m := clickUpTaskJSON("cu-3", "grandchild", "open")
+			m["parent"] = "cu-2"
+			return m
+		}(),
+	})
+	pr := newFakeProductive(t)
+	cfg := testConfig(cu.baseURL(), pr.baseURL())
+	cfg.MaxSubtaskDepth = 5 // deliberately wrong: the plan will attempt level 2
+
+	res := runSync(t, cfg, RunOptions{})
+	if res.Created != 3 || res.Failed != 0 {
+		t.Fatalf("created=%d failed=%d errors=%v", res.Created, res.Failed, res.Errors)
+	}
+	if got := pr.findByClickUpID("cu-3"); len(got) != 1 || got[0].ParentTaskID != "" {
+		t.Fatalf("grandchild should exist and be flat: %+v", got)
+	}
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "retrying as a flat task") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the degradation must be reported, warnings = %v", res.Warnings)
 	}
 }
 

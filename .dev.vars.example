@@ -14,6 +14,19 @@ CLICKUP_TOKEN=
 PRODUCTIVE_TOKEN=
 PRODUCTIVE_ORG_ID=
 
+# DeliverIT fanout (optional) — the dit_… key from DeliverIT → /integracje.
+# Empty = the DeliverIT stage is off with a warning; ClickUp → Productive still runs.
+# Under `wrangler dev` this is a WORKER secret: only the outbound handler uses it and
+# the container gets its dit_+8 prefix. The DELIVERIT service binding resolves
+# LOCALLY there (wrangler.jsonc does not set "remote": true on it): without a local
+# `wrangler dev` of deliverit-internal every call gets 503 `Worker "deliverit-internal"
+# not found` — production is not called. A well-formed dummy (dit_ + 43 of
+# A-Z a-z 0-9 - _) is enough to check that the container reaches the handler
+# (README „Fanout do DeliverIT” → „Znane ryzyka”).
+# Under `make run` (plain docker, no Worker, no outbound handler) the container reads
+# it itself — DIRECT mode, which also needs DELIVERIT_BASE_URL=https://… below.
+DELIVERIT_API_KEY=
+
 # --- optional: everything below has a compiled-in default in the Go binary ---
 # CLICKUP_LIST_ID=900501332334
 # PRODUCTIVE_PROJECT_ID=860646
@@ -42,3 +55,7 @@ PRODUCTIVE_ORG_ID=
 # MAX_RETRIES=4
 # SYNC_TIMEOUT=10m
 # LOG_LEVEL=info
+# DeliverIT: empty base URL = stage off. wrangler.jsonc sets http://deliverit.internal
+# (proxied); for `make run` use https://internal.deliverit.pl (direct, hits production).
+# DELIVERIT_BASE_URL=
+# DELIVERIT_RPS=2

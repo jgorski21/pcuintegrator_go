@@ -62,10 +62,32 @@ func testConfig(clickUpBase, productiveBase string) Config {
 		MaxWrites:          10_000,
 		MaxPages:           50,
 		MaxRetries:         3,
-		SyncTimeout:        30 * time.Second,
+		SyncTimeout:        5 * time.Minute, // above deliverITMinBudget, so handler tests reach the fanout
 		HTTPTimeout:        5 * time.Second,
 		LogLevel:           slog.LevelError,
+
+		// DeliverIT stage OFF unless a test opts in with withDeliverIT — the
+		// ClickUp -> Productive tests above must not depend on it.
+		DeliverITRPS: 10_000,
 	}
+}
+
+// testDeliverITKey has the right shape (dit_ + 43 base64url chars) and exists in
+// no DeliverIT anywhere.
+const testDeliverITKey = "dit_Ab3dE5gHq9Zx_TkL2mNp-VwY7cRsU0aBdEfGhIjKlMn"
+
+// strayDeliverITKey is a second well-formed key, pasted into the WRONG variable
+// (DELIVERIT_BASE_URL). It differs from testDeliverITKey on purpose: the client
+// masks its own key, so only a different value proves that no message quotes the
+// configured base URL.
+const strayDeliverITKey = "dit_Zz9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF_eD-cBaZyXw"
+
+// withDeliverIT points the DeliverIT stage at a fake in DIRECT mode (httptest is
+// plain http on 127.0.0.1, which the base URL rule allows for loopback only).
+func withDeliverIT(cfg Config, dit *fakeDeliverIT) Config {
+	cfg.DeliverITBaseURL = dit.baseURL()
+	cfg.DeliverITAPIKey = testDeliverITKey
+	return cfg
 }
 
 type recordedCall struct {
@@ -80,6 +102,12 @@ type fakeClickUp struct {
 	mu    sync.Mutex
 	tasks []map[string]any // raw JSON task objects, so tests can use odd shapes
 	calls []recordedCall
+
+	// otherLists serves lists other than the synced one (DeliverIT fanout), keyed
+	// by list id; any list id not in here gets `tasks`.
+	otherLists map[string][]map[string]any
+	// listNames answers GET list/{id}; an id not in here is a 404.
+	listNames map[string]string
 
 	// failWith, when non-zero, makes every read return this status with failBody.
 	failWith int
@@ -109,11 +137,31 @@ func (f *fakeClickUp) handle(w http.ResponseWriter, r *http.Request) {
 	f.calls = append(f.calls, recordedCall{Method: r.Method, Path: r.URL.RequestURI()})
 	failWith, failBody := f.failWith, f.failBody
 	tasks := f.tasks
+	rest, _ := strings.CutPrefix(r.URL.Path, "/api/v2/list/")
+	if listID, ok := strings.CutSuffix(rest, "/task"); ok {
+		if other, found := f.otherLists[listID]; found {
+			tasks = other
+		}
+	}
 	f.mu.Unlock()
 
 	if failWith != 0 {
 		w.WriteHeader(failWith)
 		_, _ = w.Write([]byte(failBody))
+		return
+	}
+
+	if !strings.HasSuffix(r.URL.Path, "/task") {
+		f.mu.Lock()
+		name, ok := f.listNames[rest]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"err":"List not found","ECODE":"ITEM_013"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": rest, "name": name})
 		return
 	}
 
@@ -181,6 +229,12 @@ type fakeProductive struct {
 
 	// omitTotals drops meta.total_pages/total_count so the empty-page fallback runs.
 	omitTotals bool
+
+	// otherLists serves task lists other than the synced one (DeliverIT fanout),
+	// keyed by filter[task_list_id]; any other id gets `tasks`.
+	otherLists map[string][]*fakeProductiveTask
+	// taskListNames answers GET task_lists/{id}; an id not in here is a 404.
+	taskListNames map[string]string
 
 	srv *httptest.Server
 }
@@ -253,6 +307,19 @@ func (f *fakeProductive) handle(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		if id, ok := strings.CutPrefix(r.URL.Path, "/api/v2/task_lists/"); ok {
+			f.mu.Lock()
+			name, found := f.taskListNames[id]
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "application/vnd.api+json")
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"errors":[{"status":"404","title":"Not found"}]}`))
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"data":{"id":%q,"type":"task_lists","attributes":{"name":%q}}}`, id, name)
+			return
+		}
 		f.handleList(w, r)
 	case http.MethodPost:
 		f.handleCreate(w, bodyBytes)
@@ -267,8 +334,12 @@ func (f *fakeProductive) handleList(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	failStatus, failBody := f.readFailStatus, f.readFailBody
 	all := make([]*fakeProductiveTask, 0, len(f.tasks))
-	for _, t := range f.tasks {
-		all = append(all, t)
+	if other, ok := f.otherLists[r.URL.Query().Get("filter[task_list_id]")]; ok {
+		all = append(all, other...)
+	} else {
+		for _, t := range f.tasks {
+			all = append(all, t)
+		}
 	}
 	statusNames := f.statusNames
 	includedOnlyFirst, omitTotals := f.includedOnlyFirstPage, f.omitTotals
@@ -573,4 +644,113 @@ func fmtCalls(calls []recordedCall) string {
 		fmt.Fprintf(&sb, "%s %s\n", c.Method, c.Path)
 	}
 	return sb.String()
+}
+
+// --- fake DeliverIT (/api/integrations) ---
+
+type ditRecorded struct {
+	Method string
+	Path   string
+	Header http.Header
+	Body   string
+}
+
+// fakeDeliverIT mimics the two integration routes. It checks the key exactly like
+// the real API does (401 API_KEY_INVALID problem+json), so a request that loses its
+// Authorization header fails loudly instead of passing by accident.
+type fakeDeliverIT struct {
+	mu       sync.Mutex
+	projects string // body of GET /api/integrations/projects
+	requests []ditRecorded
+
+	// listResponse, when set, replaces the project list response.
+	listResponse func(w http.ResponseWriter, r *http.Request)
+	// onSync, when set, answers POST …/tasks/sync; n is the 1-based POST count.
+	// Default: 200 with created = number of tasks in the batch.
+	onSync func(n int, projectID string, req ditSyncRequest, w http.ResponseWriter, r *http.Request)
+
+	srv *httptest.Server
+}
+
+func newFakeDeliverIT(t *testing.T, projects ...string) *fakeDeliverIT {
+	t.Helper()
+	f := &fakeDeliverIT{projects: "[" + strings.Join(projects, ",") + "]"}
+	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeDeliverIT) baseURL() string { return f.srv.URL }
+
+func (f *fakeDeliverIT) recorded() []ditRecorded {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ditRecorded(nil), f.requests...)
+}
+
+func (f *fakeDeliverIT) posts() []ditRecorded {
+	var out []ditRecorded
+	for _, r := range f.recorded() {
+		if r.Method == http.MethodPost {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *fakeDeliverIT) handle(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.requests = append(f.requests, ditRecorded{r.Method, r.URL.EscapedPath(), r.Header.Clone(), string(body)})
+	posts := 0
+	for _, rec := range f.requests {
+		if rec.Method == http.MethodPost {
+			posts++
+		}
+	}
+	projects, listResponse, onSync := f.projects, f.listResponse, f.onSync
+	f.mu.Unlock()
+
+	if r.Header.Get("Authorization") != "Bearer "+testDeliverITKey {
+		writeProblem(w, http.StatusUnauthorized, `{"title":"Wymagane uwierzytelnienie.","status":401,`+
+			`"detail":"Klucz API jest nieprawidłowy albo został unieważniony.","code":"API_KEY_INVALID","traceId":"00-fake-01"}`)
+		return
+	}
+
+	if r.Method == http.MethodGet && r.URL.Path == "/api/integrations/projects" {
+		if listResponse != nil {
+			listResponse(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = io.WriteString(w, projects)
+		return
+	}
+
+	id, okPrefix := strings.CutPrefix(r.URL.Path, "/api/integrations/projects/")
+	id, okSuffix := strings.CutSuffix(id, "/tasks/sync")
+	if r.Method != http.MethodPost || !okPrefix || !okSuffix {
+		http.NotFound(w, r)
+		return
+	}
+	var req ditSyncRequest
+	_ = json.Unmarshal(body, &req)
+	if onSync != nil {
+		onSync(posts, id, req, w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `{"created":%d,"renamed":0,"unchanged":0,"skipped":[]}`, len(req.Tasks))
+}
+
+func writeProblem(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
+
+// linkedProjectJSON renders one LinkedProjectDto exactly as DeliverIT does.
+func linkedProjectJSON(id, name, client string, source int, listID string) string {
+	return fmt.Sprintf(`{"id":%q,"name":%q,"clientName":%q,"taskList":{"source":%d,"externalId":%q}}`,
+		id, name, client, source, listID)
 }

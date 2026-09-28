@@ -300,10 +300,14 @@ type Result struct {
 	Actions  []actionSummary `json:"actions,omitempty"` // dry-run / explain only
 	Warnings []string        `json:"warnings,omitempty"`
 	Errors   []string        `json:"errors,omitempty"`
-	Aborted  string          `json:"aborted,omitempty"`
+	Aborted  string          `json:"aborted,omitempty"` // the ClickUp -> Productive stage only
 
 	ClickUpAPI    clientStats `json:"clickup_api"`
 	ProductiveAPI clientStats `json:"productive_api"`
+
+	// DeliverIT is the second stage (fanout.go). Its errors live in its own
+	// section, never in Errors/Aborted above: they make the run a 207, never a 422.
+	DeliverIT deliverITResult `json:"deliverit"`
 }
 
 type RunOptions struct {
@@ -320,7 +324,9 @@ func newRunID() string {
 	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
 }
 
-// Run is the whole pipeline: read both sides, plan, check the breakers, write.
+// Run is the whole pipeline: the ClickUp -> Productive stage (read both sides,
+// plan, check the breakers, write), then the DeliverIT fanout — which runs
+// whatever the first stage's outcome was, aborts included.
 func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Result {
 	runID := opts.RunID
 	if runID == "" {
@@ -348,6 +354,17 @@ func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Re
 		res.ProductiveAPI = pr.Stats()
 	}()
 
+	read := syncProductive(ctx, cfg, opts, res, cu, pr, log)
+	res.DeliverIT = runDeliverIT(ctx, cfg, opts, cu, pr, read, log)
+	return res
+}
+
+// syncProductive is the ClickUp -> Productive stage. Every early return is an
+// abort of THIS stage only; the returned clickUpRead lets the fanout reuse the
+// ClickUp list it already read (or know that the read failed).
+func syncProductive(ctx context.Context, cfg Config, opts RunOptions, res *Result, cu, pr *apiClient, log *slog.Logger) clickUpRead {
+	var read clickUpRead
+
 	res.Phase = "fetch_productive"
 	log.Info("fetching productive")
 	snap, err := fetchProductive(ctx, pr, cfg)
@@ -357,19 +374,20 @@ func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Re
 		res.Phase, res.Aborted = "failed", "fetch_productive"
 		res.Errors = append(res.Errors, err.Error())
 		log.Error("productive fetch failed; nothing written", "err", err)
-		return res
+		return read
 	}
 	log.Info("productive fetched", "tasks", snap.Stats.Tasks, "keyed", len(snap.ByClickUpID))
 
 	res.Phase = "fetch_clickup"
 	clickUpTasks, cuStats, cuWarnings, err := fetchClickUp(ctx, cu, cfg)
+	read = clickUpRead{attempted: true, tasks: clickUpTasks, err: err}
 	res.ClickUp = cuStats
 	res.Warnings = append(res.Warnings, cuWarnings...)
 	if err != nil {
 		res.Phase, res.Aborted = "failed", "fetch_clickup"
 		res.Errors = append(res.Errors, err.Error())
 		log.Error("clickup fetch failed; nothing written", "err", err)
-		return res
+		return read
 	}
 	log.Info("clickup fetched", "tasks", cuStats.Tasks, "subtasks", cuStats.Subtasks)
 
@@ -400,7 +418,7 @@ func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Re
 			p.Creates, maxCreates, p.Creates))
 		res.Actions = summarize(p, snap, cfg, true)
 		log.Error("create breaker tripped", "planned", p.Creates, "limit", maxCreates)
-		return res
+		return read
 	}
 	if p.Creates+p.Updates > maxWrites {
 		res.Phase, res.Aborted = "aborted", "max_writes_exceeded"
@@ -409,14 +427,14 @@ func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Re
 			p.Creates+p.Updates, maxWrites))
 		res.Actions = summarize(p, snap, cfg, true)
 		log.Error("write breaker tripped", "planned", p.Creates+p.Updates, "limit", maxWrites)
-		return res
+		return read
 	}
 
 	if opts.DryRun {
 		res.Phase = "done"
 		res.Actions = summarize(p, snap, cfg, true)
 		log.Info("dry run complete; no writes issued")
-		return res
+		return read
 	}
 
 	res.Phase = "execute"
@@ -429,7 +447,7 @@ func Run(ctx context.Context, cfg Config, opts RunOptions, log *slog.Logger) *Re
 	}
 	log.Info("run complete", "created", res.Created, "updated", res.Updated,
 		"skipped", res.Skipped, "failed", res.Failed, "ambiguous", res.Ambiguous)
-	return res
+	return read
 }
 
 // Execute walks the plan in order, resolving parents created earlier in this run.

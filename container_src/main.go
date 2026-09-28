@@ -76,9 +76,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// The key itself is never logged: only its "dit_" + 8 prefix, the same string
+	// DeliverIT shows in /integracje.
+	ditSetup := cfg.deliverITSetup()
+	ditBase := ""
+	if ditSetup.Base != nil {
+		ditBase = ditSetup.Base.String()
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("listening",
+			"deliverit_enabled", ditSetup.Enabled,
+			"deliverit_base_url", ditBase,
+			"deliverit_proxied", ditSetup.Proxied,
+			"deliverit_api_key", ditSetup.KeyLabel,
+			"deliverit_disabled_reason", ditSetup.DisabledReason,
+			"deliverit_rps", cfg.DeliverITRPS,
 			"addr", srv.Addr,
 			"clickup_list", cfg.ClickUpListID,
 			"productive_task_list", cfg.ProductiveTaskListID,
@@ -214,7 +228,9 @@ func (s *server) handleSync(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case res.Aborted != "":
 			status = http.StatusUnprocessableEntity
-		case res.Failed > 0:
+		// A DeliverIT failure is a partial failure of the run and never a 422:
+		// the ClickUp -> Productive stage did its job.
+		case res.Failed > 0 || res.DeliverIT.failed():
 			status = http.StatusMultiStatus
 		}
 		w.Header().Set("X-Run-Id", res.RunID)

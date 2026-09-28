@@ -174,6 +174,53 @@ func TestSyncRunsAndRecordsLastResult(t *testing.T) {
 	}
 }
 
+// A DeliverIT failure is a partial failure of the run (207), never 422: the
+// ClickUp -> Productive stage completed.
+func TestSyncReturns207WhenTheDeliverITStageFails(t *testing.T) {
+	cu := newFakeClickUp(t, clickUpTasksFor(2))
+	pr := newFakeProductive(t)
+	dit := newFakeDeliverIT(t, cuMainProject)
+	dit.onSync = func(_ int, _ string, _ ditSyncRequest, w http.ResponseWriter, _ *http.Request) {
+		writeProblem(w, http.StatusConflict, ditMismatchJSON)
+	}
+	_, h := newTestServer(t, withDeliverIT(testConfig(cu.baseURL(), pr.baseURL()), dit))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sync", nil))
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207; body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Created   int `json:"created"`
+		DeliverIT struct {
+			Errors []string `json:"errors"`
+		} `json:"deliverit"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Created != 2 || len(body.DeliverIT.Errors) != 1 {
+		t.Fatalf("body = %+v", body)
+	}
+}
+
+// Not configured yet (the Worker secret is set after the first deploy) is a
+// warning, not a failure.
+func TestSyncReturns200WhenTheDeliverITKeyIsMissing(t *testing.T) {
+	cu := newFakeClickUp(t, clickUpTasksFor(1))
+	pr := newFakeProductive(t)
+	dit := newFakeDeliverIT(t, cuMainProject)
+	cfg := withDeliverIT(testConfig(cu.baseURL(), pr.baseURL()), dit)
+	cfg.DeliverITAPIKey = ""
+	_, h := newTestServer(t, cfg)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sync", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "DELIVERIT_API_KEY is not set") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 // An aborted run must not look like a success to the caller.
 func TestSyncReturns422WhenAborted(t *testing.T) {
 	cu := newFakeClickUp(t, clickUpTasksFor(2))

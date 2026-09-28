@@ -36,6 +36,11 @@ type Task struct {
 	Tags            []string `json:"tags"`              // normalized: trimmed, non-empty, deduped, SORTED
 	InitialEstimate *int     `json:"initial_estimate"`  // minutes; nil == none
 	ClickUpParentID string   `json:"clickup_parent_id"` // "" == root
+
+	// SourceTitle is the trimmed ClickUp name BEFORE the cut to Productive's 140
+	// characters; the DeliverIT fanout sends it (DeliverIT keeps 300). Like the
+	// parent, it is outside diffReasons, so it can never cause a PATCH.
+	SourceTitle string `json:"-"`
 }
 
 // equalForSync decides whether a PATCH is needed. It must be a free function:

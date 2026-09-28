@@ -34,6 +34,14 @@
     "bindings": [{ "name": "SYNC_CONTAINER", "class_name": "SyncContainer" }]
   },
 
+  // DeliverIT fanout: the container's calls to http://deliverit.internal are handled
+  // by deliverITOutbound (src/index.ts) and forwarded over THIS binding — inside
+  // Cloudflare, past the deliverit.pl zone's Bot Fight Mode / WAF, never with a
+  // CF-Connecting-IP shared with other customers' Workers. The Worker name
+  // `deliverit-internal` is therefore a contract: renaming or deleting that Worker
+  // breaks the binding, and `deliverit-internal` must be deployed before this one.
+  "services": [{ "binding": "DELIVERIT", "service": "deliverit-internal" }],
+
   // Container-enabled Durable Objects must use new_sqlite_classes, not new_classes.
   // The SQLite store is where the lease lock and the last run summary live, which is
   // what makes them survive a container restart.
@@ -68,10 +76,21 @@
     // reproduce the .NET behaviour exactly.
     "MERGE_CUSTOM_FIELDS": "true",
 
-    // Must stay <= 12m: Cloudflare SIGKILLs 15 minutes after SIGTERM.
+    // Must stay <= 12m: Cloudflare SIGKILLs 15 minutes after SIGTERM. The DeliverIT
+    // stage runs inside the same deadline and is skipped (with a warning) when
+    // less than 90s is left.
     "SYNC_TIMEOUT": "10m",
 
-    "LOG_LEVEL": "info"
+    "LOG_LEVEL": "info",
+
+    // DeliverIT fanout, after ClickUp -> Productive in every run. The virtual host
+    // of the outbound handler, NOT a public address; "" switches the stage off.
+    // https://internal.deliverit.pl here would be DIRECT egress through the
+    // public zone — README „Fanout do DeliverIT” → emergency fallback.
+    "DELIVERIT_BASE_URL": "http://deliverit.internal",
+    // Validated in (0, 4], i.e. >= 250 ms between requests. DeliverIT's limiter is
+    // 300/min per IP and runs before authentication.
+    "DELIVERIT_RPS": "2"
   }
 
   // Secrets (never here — use `wrangler secret put`):
@@ -80,4 +99,8 @@
   //   CLICKUP_TOKEN       raw pk_… token
   //   PRODUCTIVE_TOKEN    X-Auth-Token
   //   PRODUCTIVE_ORG_ID   X-Organization-Id
+  //   DELIVERIT_API_KEY   optional; dit_… from DeliverIT → /integracje. Used ONLY by
+  //                       the outbound handler, never forwarded to the container
+  //                       (which gets its dit_+8 prefix). Absent = DeliverIT stage
+  //                       off with a warning; ClickUp -> Productive unaffected.
 }

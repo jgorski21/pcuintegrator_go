@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -89,6 +90,21 @@ type Config struct {
 	SyncTimeout        time.Duration // must stay below the 15min SIGTERM->SIGKILL window
 	HTTPTimeout        time.Duration
 
+	// --- DeliverIT fanout (optional stage, see fanout.go) ---
+	//
+	// DeliverITBaseURL "" switches the stage off. http://deliverit.internal is the
+	// PROXIED mode (production): the Worker's outbound handler forwards the two
+	// integration routes over a service binding and sets Authorization from its own
+	// secret, so the key never enters this process. Any https:// URL is the DIRECT
+	// mode (local `make run`, emergency fallback), which needs DeliverITAPIKey.
+	DeliverITBaseURL string
+	DeliverITAPIKey  string // DIRECT mode only; never blocks the start when absent or malformed
+	// DeliverITKeyPrefix is "dit_" + 8 characters of the Worker secret, computed by
+	// src/index.ts in PROXIED mode: it tells this process whether the secret is set
+	// and names the key in logs, the same way DeliverIT's /integracje does.
+	DeliverITKeyPrefix string
+	DeliverITRPS       float64 // (0, 4]: at least 250 ms between requests
+
 	// --- process ---
 	Port     string
 	LogLevel slog.Level
@@ -144,6 +160,13 @@ func LoadConfig() (Config, error) {
 		MaxRetries:         envInt("MAX_RETRIES", 4),
 		SyncTimeout:        envDur("SYNC_TIMEOUT", 10*time.Minute),
 		HTTPTimeout:        envDur("HTTP_TIMEOUT", 60*time.Second),
+
+		// Trimmed: a key pasted into an env file with a trailing CRLF would
+		// otherwise be a baffling 401.
+		DeliverITBaseURL:   strings.TrimSpace(os.Getenv("DELIVERIT_BASE_URL")),
+		DeliverITAPIKey:    strings.TrimSpace(os.Getenv("DELIVERIT_API_KEY")),
+		DeliverITKeyPrefix: strings.TrimSpace(os.Getenv("DELIVERIT_API_KEY_PREFIX")),
+		DeliverITRPS:       envFloat("DELIVERIT_RPS", 2.0),
 
 		Port: envStr("PORT", "8080"),
 	}
@@ -238,7 +261,100 @@ func (c Config) validate() error {
 	if len(c.EstimateLabelMinutes) == 0 {
 		return fmt.Errorf("CLICKUP_ESTIMATE_LABEL_MINUTES resolved to an empty map")
 	}
+	// DeliverIT's rate limiter (300/min per IP) runs before authentication, and in
+	// DIRECT mode the bucket may be shared with other traffic from the same egress.
+	//
+	// DeliverIT messages name the variable and never quote its value (unlike the
+	// Productive ones above): a key pasted into the wrong DELIVERIT_* variable
+	// would otherwise land in the container log.
+	if c.DeliverITRPS <= 0 || c.DeliverITRPS > deliverITMaxRPS {
+		return fmt.Errorf("DELIVERIT_RPS must be in (0, %v] — at least 250 ms between requests to DeliverIT",
+			deliverITMaxRPS)
+	}
+	// Validated at start because it is a deploy-time var: a typo must surface on the
+	// first deploy, not as a key sent to the wrong place. The KEY is deliberately
+	// NOT validated here (see deliverITSetup): a missing or broken DeliverIT key
+	// must never stop the ClickUp -> Productive sync. parseDeliverITBaseURL never
+	// echoes the URL (TestDeliverITConfigErrorsNeverQuoteTheValue).
+	if c.DeliverITBaseURL != "" {
+		if _, _, err := parseDeliverITBaseURL(c.DeliverITBaseURL); err != nil {
+			return fmt.Errorf("DELIVERIT_BASE_URL: %w", err)
+		}
+	}
 	return nil
+}
+
+// deliverITSetup is what the fanout stage runs with, derived from Config without
+// I/O. It never fails: every problem becomes a disabled stage with a reason, plus
+// a warning (not configured yet) or an error (configured wrongly).
+type deliverITSetup struct {
+	Enabled        bool
+	Proxied        bool
+	Base           *url.URL
+	APIKey         string // DIRECT mode only; "" when proxied
+	KeyLabel       string // "dit_XXXXXXXX…" — the only form of the key that is ever logged
+	DisabledReason string
+	Warning        string
+	Error          string
+}
+
+func (c Config) deliverITSetup() deliverITSetup {
+	var s deliverITSetup
+	if c.DeliverITBaseURL == "" {
+		s.DisabledReason = "DELIVERIT_BASE_URL is empty"
+		return s
+	}
+	base, proxied, err := parseDeliverITBaseURL(c.DeliverITBaseURL)
+	if err != nil {
+		s.DisabledReason = "invalid DELIVERIT_BASE_URL"
+		s.Error = "DELIVERIT_BASE_URL: " + err.Error()
+		return s
+	}
+	s.Base, s.Proxied = base, proxied
+
+	if proxied {
+		if c.DeliverITAPIKey != "" {
+			s.Warning = "DELIVERIT_API_KEY in the container environment is ignored: in proxied mode the Worker's " +
+				"outbound handler sets Authorization — remove it from the container environment"
+		}
+		switch {
+		case c.DeliverITKeyPrefix == "":
+			s.DisabledReason = "Worker secret DELIVERIT_API_KEY is not set"
+			s.Warning = joinNonEmpty(s.Warning, "Worker secret DELIVERIT_API_KEY is not set; DeliverIT fanout disabled "+
+				"(generate a key in DeliverIT → /integracje, then `npx wrangler secret put DELIVERIT_API_KEY`)")
+		case !validDeliverITKeyPrefix(c.DeliverITKeyPrefix):
+			s.DisabledReason = "Worker secret DELIVERIT_API_KEY is malformed"
+			s.Error = "Worker secret DELIVERIT_API_KEY is malformed (expected the dit_… key shown once in DeliverIT → " +
+				"/integracje); DeliverIT fanout disabled"
+		default:
+			s.Enabled, s.KeyLabel = true, c.DeliverITKeyPrefix+"…"
+		}
+		return s
+	}
+
+	switch {
+	case c.DeliverITAPIKey == "":
+		s.DisabledReason = "DELIVERIT_API_KEY is not set"
+		s.Warning = "DELIVERIT_API_KEY is not set; DeliverIT fanout disabled (direct mode needs the dit_… key " +
+			"from DeliverIT → /integracje in the container environment)"
+	case !validDeliverITAPIKey(c.DeliverITAPIKey):
+		s.DisabledReason = "DELIVERIT_API_KEY is malformed"
+		s.Error = "DELIVERIT_API_KEY is malformed (expected dit_… exactly as shown in DeliverIT → /integracje); " +
+			"DeliverIT fanout disabled"
+	default:
+		s.Enabled, s.APIKey, s.KeyLabel = true, c.DeliverITAPIKey, deliverITKeyLabel(c.DeliverITAPIKey)
+	}
+	return s
+}
+
+func joinNonEmpty(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, "; ")
 }
 
 // statusIDFor maps the internal enum to the Productive workflow_status id written

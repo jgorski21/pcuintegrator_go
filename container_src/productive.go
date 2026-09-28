@@ -115,66 +115,17 @@ func fetchProductive(ctx context.Context, c *apiClient, cfg Config) (productiveS
 		},
 	}
 
-	statusNames := map[string]string{}
-	collected := make([]productiveTaskData, 0, 256)
-	seenProductiveID := map[string]bool{}
-	totalPages := 0
-
-	for page := 1; page <= cfg.MaxPages; page++ {
-		path := fmt.Sprintf(
-			"tasks?filter[task_list_id]=%s&include=workflow_status,assignee&page[number]=%d&page[size]=200",
-			cfg.ProductiveTaskListID, page)
-
-		var body productiveTasksPage
-		if err := c.getJSON(ctx, path, &body); err != nil {
-			// HARD ABORT, and this is the single most important line in the file.
-			// Continuing with a partial or empty snapshot after a 401/429/500/HTML
-			// error page means every ClickUp task looks new, which POSTs a
-			// duplicate of the entire list — each one stamped with the ClickUp id,
-			// so it cannot be told apart from a legitimate task afterwards.
-			return snap, fmt.Errorf("productive: %w", err)
-		}
-		snap.Stats.Pages++
-
-		// A page may legitimately carry no `included` (.NET dereferences it
-		// unconditionally and NREs).
-		for _, inc := range body.Included {
-			if inc.Type == "workflow_statuses" {
-				statusNames[inc.ID] = inc.Attributes.Name
-			}
-		}
-
-		for _, d := range body.Data {
-			if seenProductiveID[d.ID] {
-				continue // same task seen twice due to ordering drift
-			}
-			seenProductiveID[d.ID] = true
-			collected = append(collected, d)
-		}
-
-		if page == 1 && body.Meta.TotalPages.Set {
-			totalPages = int(body.Meta.TotalPages.V)
-			snap.Stats.TotalCount = int(body.Meta.TotalCount.V)
-		}
-
-		if totalPages > 0 {
-			if page >= totalPages {
-				break
-			}
-			continue
-		}
-		// No usable meta: fall back to .NET's terminate-on-empty-page behaviour.
-		if len(body.Data) == 0 {
-			break
-		}
+	pages, err := fetchProductivePages(ctx, c, cfg.ProductiveTaskListID, "workflow_status,assignee", cfg.MaxPages)
+	snap.Stats.Pages, snap.Stats.TotalCount = pages.Pages, pages.TotalCount
+	if err != nil {
+		// HARD ABORT, and this is the single most important line in the file.
+		// Continuing with a partial or empty snapshot after a 401/429/500/HTML
+		// error page means every ClickUp task looks new, which POSTs a
+		// duplicate of the entire list — each one stamped with the ClickUp id,
+		// so it cannot be told apart from a legitimate task afterwards.
+		return snap, err
 	}
-
-	if snap.Stats.TotalCount > 0 && len(collected) < snap.Stats.TotalCount {
-		return snap, fmt.Errorf(
-			"productive: read %d of %d tasks (meta.total_count) — the list changed while paging; "+
-				"aborting rather than treating missing tasks as new",
-			len(collected), snap.Stats.TotalCount)
-	}
+	statusNames, collected := pages.StatusNames, pages.Data
 
 	for id, name := range statusNames {
 		snap.Stats.WorkflowStatusNames[id] = name
@@ -263,6 +214,80 @@ func fetchProductive(ctx context.Context, c *apiClient, cfg Config) (productiveS
 		snap.Stats.ExtraCustomFieldIDs = nil
 	}
 	return snap, nil
+}
+
+// productivePages is one task list, read in full.
+type productivePages struct {
+	Data        []productiveTaskData
+	StatusNames map[string]string // workflow_status id -> name, from `included`
+	Pages       int
+	TotalCount  int
+}
+
+// fetchProductivePages pages one task list. Shared by the sync (which needs
+// include=workflow_status,assignee) and the DeliverIT fanout (id + title only,
+// include=""). Any non-2xx and any short read against meta.total_count is an error:
+// the caller must never mistake a partial read for the whole list.
+func fetchProductivePages(ctx context.Context, c *apiClient, taskListID, include string, maxPages int) (productivePages, error) {
+	out := productivePages{StatusNames: map[string]string{}, Data: make([]productiveTaskData, 0, 256)}
+	seenProductiveID := map[string]bool{}
+	totalPages := 0
+
+	includeParam := ""
+	if include != "" {
+		includeParam = "&include=" + include
+	}
+
+	for page := 1; page <= maxPages; page++ {
+		path := fmt.Sprintf("tasks?filter[task_list_id]=%s%s&page[number]=%d&page[size]=200",
+			taskListID, includeParam, page)
+
+		var body productiveTasksPage
+		if err := c.getJSON(ctx, path, &body); err != nil {
+			return out, fmt.Errorf("productive: %w", err)
+		}
+		out.Pages++
+
+		// A page may legitimately carry no `included` (.NET dereferences it
+		// unconditionally and NREs).
+		for _, inc := range body.Included {
+			if inc.Type == "workflow_statuses" {
+				out.StatusNames[inc.ID] = inc.Attributes.Name
+			}
+		}
+
+		for _, d := range body.Data {
+			if seenProductiveID[d.ID] {
+				continue // same task seen twice due to ordering drift
+			}
+			seenProductiveID[d.ID] = true
+			out.Data = append(out.Data, d)
+		}
+
+		if page == 1 && body.Meta.TotalPages.Set {
+			totalPages = int(body.Meta.TotalPages.V)
+			out.TotalCount = int(body.Meta.TotalCount.V)
+		}
+
+		if totalPages > 0 {
+			if page >= totalPages {
+				break
+			}
+			continue
+		}
+		// No usable meta: fall back to .NET's terminate-on-empty-page behaviour.
+		if len(body.Data) == 0 {
+			break
+		}
+	}
+
+	if out.TotalCount > 0 && len(out.Data) < out.TotalCount {
+		return out, fmt.Errorf(
+			"productive: read %d of %d tasks (meta.total_count) — the list changed while paging; "+
+				"aborting rather than treating missing tasks as new",
+			len(out.Data), out.TotalCount)
+	}
+	return out, nil
 }
 
 func hasExtraCustomFields(cf map[string]json.RawMessage, cfg Config) bool {
